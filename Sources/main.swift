@@ -8,6 +8,7 @@
 import Foundation
 import Network
 
+/// Helper function to create a message frame.
 func createMessage(version: UInt8, messageType: UInt8, message: String) -> Data {
     let messageData = message.data(using: .utf8) ?? Data()
     let length = UInt32(messageData.count)
@@ -28,24 +29,30 @@ func createMessage(version: UInt8, messageType: UInt8, message: String) -> Data 
     return data
 }
 
+// Queue for QUIC things.
 let queue = DispatchQueue(label: "quic", qos: .userInteractive)
 
 // Create Inital Options for the tunnel.
 // This is using an insecure connection as this operation is meant to be local network.
 let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(integerLiteral: 4567))
 let options =  NWProtocolQUIC.Options(alpn: ["demo"])
+
+// Set the initial stream to bidirectional.
+options.direction = .bidirectional
+
 sec_protocol_options_set_verify_block(options.securityProtocolOptions, { (sec_protocol_metadata, sec_trust, sec_protocol_verify_complete) in
     sec_protocol_verify_complete(true)
 }, queue)
+
 let parameters = NWParameters(quic: options)
 
-// Create a new multiplexed connection
+// 1) Create a new multiplexed connection
 let descriptor = NWMultiplexGroup(to: endpoint)
 let group = NWConnectionGroup(with: descriptor, using: parameters)
 var mainConn: NWConnection? = nil
 
 // Here we are establishing a state handler for when the connection to the
-// the server is neogiated and "ready". Once its ready we want to open a new
+// the server is neogiated and "ready". Once its ready we want to establish a
 // stream using the group with the options set.
 //
 // This is the main location of the issue we are seeing where the stream is
@@ -58,11 +65,12 @@ group.stateUpdateHandler = { newState in
     case .ready:
         print("Connected using QUIC!")
 
-
-        // I assume I have to create a new set of options to
-        // define the stream type.
+        // 2) In normal application I may want to open different kinds of streams in providing
+        // new options. Is there a better way to select the stream kind for subsequent streams?
         let options =  NWProtocolQUIC.Options(alpn: ["demo"])
-        options.direction = .unidirectional
+        options.direction = .bidirectional
+
+        // When providing unique options the stream will fail. Removeing the using argument works.
         mainConn = group.extract()! // force unwrap
 
         mainConn?.stateUpdateHandler = { state in
@@ -71,6 +79,9 @@ group.stateUpdateHandler = { newState in
             case .ready:
 
                 // Once the connection is ready, lets send some sweet data sauce.
+                //
+                // By establishing this new stream and sending data, on the server this causes the inital
+                // stream with no handle to be open.
                 let version: UInt8 = 1
                 let messageType: UInt8 = 1
                 let message = "hello, I am from the multiplex group ready."
@@ -97,6 +108,7 @@ group.stateUpdateHandler = { newState in
 
 
 // Receive new incoming streams initiated by the remote endpoint
+// this is not used for this example.
 group.newConnectionHandler = { conn in
     print("New Connection: \(conn)")
 
@@ -105,20 +117,7 @@ group.newConnectionHandler = { conn in
       print("newState: \(newState) for \(conn)")
       switch newState {
       case .ready:
-          let version: UInt8 = 1
-          let messageType: UInt8 = 2 // Different Message Type for Remote initiated stream for debugging.
-          let message = "hello, I am from the new stream from the remote"
-          let messageData = createMessage(version: version, messageType: messageType, message: message)
-          print("Remote stream send: \(messageData)")
-          // Once the connection is ready send some delicious data sauce.
-          conn.send(content: messageData, completion: .contentProcessed({ sendError in
-              if let error = sendError {
-                  print("There was an error sending data: \(error)")
-              } else {
-                  print("Data was sent successfully.")
-              }
-          }))
-
+          print("got a new stream!")
       default:
           break
       }
@@ -131,6 +130,8 @@ group.newConnectionHandler = { conn in
 group.start(queue: queue)
 
 print("running....")
+// We iterate trying to send data on the new stream we created after the
+// connection is established.
 while true {
     switch mainConn?.state {
     case .ready:
@@ -141,11 +142,19 @@ while true {
         let messageData = createMessage(version: version, messageType: messageType, message: message)
         print("Local Stream Send: \(messageData)")
 
-        mainConn?.send(content: messageData, isComplete: true, completion: .contentProcessed({ sendError in
+        mainConn?.send(content: messageData, completion: .contentProcessed({ sendError in
             if let error = sendError {
                 print("There was an error sending data: \(error)")
             }
         }))
+        // One thing I tried was to try send data on the group connection, again the ghost stream is opened but has no
+        // handle and a new stream is open for each call to send.
+//        group.send(content: messageData, completion: { sendError in
+//            if let error = sendError {
+//                print("There was an error sending data: \(error)")
+//            }
+//        })
+
         sleep(1)
     default:
         continue
